@@ -198,6 +198,8 @@ jobs:
           import android.content.Intent
           import android.net.Uri
           import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
           import android.provider.OpenableColumns
           import android.webkit.MimeTypeMap
           import android.widget.Toast
@@ -216,23 +218,52 @@ jobs:
               abstract val targetPackage: String
               abstract val targetLabel: String
 
-              private class Payload(val text: String?, val uris: List<Uri>, val mimes: List<String>)
+              private class Payload(
+                  val text: String?,
+                  val captionSource: String,
+                  val uris: List<Uri>,
+                  val mimes: List<String>,
+                  val notes: List<String>
+              )
+
+              private var started = false
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
-                  val incoming = intent
-                  val action = incoming?.action
+                  val action = intent?.action
                   if (action != Intent.ACTION_SEND && action != Intent.ACTION_SEND_MULTIPLE) {
                       finish()
                       return
                   }
+                  // We wait for window focus (Android only lets a focused app read the clipboard),
+                  // but never longer than a moment.
+                  Handler(Looper.getMainLooper()).postDelayed({ begin() }, 800)
+              }
+
+              override fun onWindowFocusChanged(hasFocus: Boolean) {
+                  super.onWindowFocusChanged(hasFocus)
+                  if (hasFocus) begin()
+              }
+
+              private fun begin() {
+                  if (started || isFinishing) return
+                  started = true
+                  val incoming = intent
+                  val clip = if (Store.clipCaption(this)) recentClipboardText() else null
+                  val header = "To $targetLabel | from=${referrer?.host ?: "?"} | " +
+                      "${incoming.action?.substringAfterLast('.')} type=${incoming.type} | " +
+                      "extras=${incoming.extras?.keySet()?.joinToString(",") ?: "-"}"
+
                   toast("Sending to $targetLabel…")
                   Thread {
-                      val result = runCatching { prepare(incoming) }
+                      val result = runCatching { prepare(incoming, clip) }
                       runOnUiThread {
                           result
-                              .onSuccess { launchTarget(it) }
-                              .onFailure { toast("Couldn't read the shared post: ${it.message}") }
+                              .onSuccess { p -> launchTarget(p, header) }
+                              .onFailure { e ->
+                                  Store.log(this, "$header | READ FAILED: $e")
+                                  toast("Couldn't read the shared post: ${e.message}")
+                              }
                           finish()
                       }
                   }.start()
@@ -240,22 +271,50 @@ jobs:
 
               // ---------- reading what was shared ----------
 
-              private fun prepare(incoming: Intent): Payload {
-                  val text = incoming.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString()?.takeIf { it.isNotBlank() }
-                      ?: incoming.clipData?.let { cd ->
-                          (0 until cd.itemCount).firstNotNullOfOrNull { cd.getItemAt(it).text?.toString()?.takeIf { s -> s.isNotBlank() } }
+              private fun recentClipboardText(): String? {
+                  return try {
+                      val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                      val clip = cm.primaryClip
+                      if (clip == null || clip.itemCount == 0) {
+                          null
+                      } else {
+                          val ageMs = System.currentTimeMillis() - clip.description.timestamp
+                          if (ageMs > 10 * 60 * 1000L) null
+                          else clip.getItemAt(0).coerceToText(this)?.toString()?.takeIf { it.isNotBlank() }
                       }
+                  } catch (e: Exception) {
+                      null
+                  }
+              }
+
+              private fun prepare(incoming: Intent, clip: String?): Payload {
+                  val shared = incoming.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString()?.takeIf { it.isNotBlank() }
+                      ?: incoming.clipData?.let { cd ->
+                          (0 until cd.itemCount).firstNotNullOfOrNull {
+                              cd.getItemAt(it).text?.toString()?.takeIf { s -> s.isNotBlank() }
+                          }
+                      }
+                  val text = shared ?: clip
+                  val captionSource = when {
+                      shared != null -> "shared"
+                      clip != null -> "clipboard"
+                      else -> "none"
+                  }
 
                   val sources = ArrayList<Uri>()
                   if (incoming.action == Intent.ACTION_SEND) {
                       IntentCompat.getParcelableExtra(incoming, Intent.EXTRA_STREAM, Uri::class.java)?.let { sources.add(it) }
                   } else {
-                      IntentCompat.getParcelableArrayListExtra(incoming, Intent.EXTRA_STREAM, Uri::class.java)?.let { sources.addAll(it) }
+                      IntentCompat.getParcelableArrayListExtra(incoming, Intent.EXTRA_STREAM, Uri::class.java)
+                          ?.let { sources.addAll(it) }
                   }
                   if (sources.isEmpty()) {
                       incoming.clipData?.let { cd ->
                           for (i in 0 until cd.itemCount) cd.getItemAt(i).uri?.let { sources.add(it) }
                       }
+                  }
+                  if (sources.isEmpty() && text == null) {
+                      error("nothing to forward (no file and no text in the share)")
                   }
 
                   val dir = File(cacheDir, "shared").apply { mkdirs() }
@@ -263,23 +322,47 @@ jobs:
 
                   val uris = ArrayList<Uri>()
                   val mimes = ArrayList<String>()
+                  val notes = ArrayList<String>()
                   for (src in sources) {
-                      val (uri, mime) = copyToCache(src, dir)
-                      uris.add(uri)
-                      mimes.add(mime)
+                      try {
+                          val (uri, mime) = copyToCache(src, dir, incoming.type)
+                          uris.add(uri)
+                          mimes.add(mime)
+                      } catch (e: Exception) {
+                          // Couldn't copy: hand the original link over instead of failing.
+                          notes.add("copy failed (${e.javaClass.simpleName}); sent original")
+                          uris.add(src)
+                          mimes.add(specific(incoming.type) ?: specific(contentResolver.getType(src)) ?: "*/*")
+                      }
                   }
-                  return Payload(text, uris, mimes)
+                  return Payload(text, captionSource, uris, mimes, notes)
               }
 
-              private fun copyToCache(src: Uri, dir: File): Pair<Uri, String> {
+              private fun copyToCache(src: Uri, dir: File, incomingType: String?): Pair<Uri, String> {
                   val name = displayName(src) ?: "file"
                   val safe = name.replace(Regex("[^A-Za-z0-9._-]"), "_")
-                  val dest = File(dir, "${UUID.randomUUID().toString().take(8)}_$safe")
+                  var dest = File(dir, "${UUID.randomUUID().toString().take(8)}_$safe")
                   val input = contentResolver.openInputStream(src) ?: error("cannot open $src")
                   input.use { i -> dest.outputStream().use { o -> i.copyTo(o) } }
-                  val mime = contentResolver.getType(src) ?: guessMime(safe)
+
+                  val mime = specific(contentResolver.getType(src))
+                      ?: specific(guessMime(safe))
+                      ?: sniff(dest)
+                      ?: specific(incomingType)
+                      ?: "application/octet-stream"
+
+                  // WhatsApp relies on the extension, so add one if the source had none.
+                  if (dest.extension.isEmpty()) {
+                      MimeTypeMap.getSingleton().getExtensionFromMimeType(mime)?.let { ext ->
+                          val renamed = File(dir, dest.name + "." + ext)
+                          if (dest.renameTo(renamed)) dest = renamed
+                      }
+                  }
                   return FileProvider.getUriForFile(this, "$packageName.fileprovider", dest) to mime
               }
+
+              private fun specific(m: String?): String? =
+                  m?.takeIf { it.isNotBlank() && !it.endsWith("/*") && it != "application/octet-stream" }
 
               private fun displayName(uri: Uri): String? = runCatching {
                   contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
@@ -287,9 +370,30 @@ jobs:
                   }
               }.getOrNull() ?: uri.lastPathSegment
 
-              private fun guessMime(name: String): String {
+              private fun guessMime(name: String): String? {
                   val ext = name.substringAfterLast('.', "").lowercase()
-                  return MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "application/octet-stream"
+                  if (ext.isEmpty()) return null
+                  return MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
+              }
+
+              /** Last resort: look at the first bytes of the file. */
+              private fun sniff(f: File): String? {
+                  val b = ByteArray(16)
+                  val n = f.inputStream().use { it.read(b) }
+                  if (n < 4) return null
+                  fun at(i: Int, s: String): Boolean =
+                      n >= i + s.length && s.indices.all { b[i + it] == s[it].code.toByte() }
+                  return when {
+                      b[0] == 0xFF.toByte() && b[1] == 0xD8.toByte() -> "image/jpeg"
+                      at(1, "PNG") -> "image/png"
+                      at(0, "GIF8") -> "image/gif"
+                      at(0, "RIFF") && at(8, "WEBP") -> "image/webp"
+                      at(4, "ftyp") -> "video/mp4"
+                      at(0, "OggS") -> "audio/ogg"
+                      at(0, "ID3") -> "audio/mpeg"
+                      at(0, "%PDF") -> "application/pdf"
+                      else -> null
+                  }
               }
 
               private fun cleanOldFiles(dir: File) {
@@ -299,7 +403,7 @@ jobs:
 
               // ---------- re-sharing ----------
 
-              private fun launchTarget(p: Payload) {
+              private fun launchTarget(p: Payload, header: String) {
                   val multi = p.uris.size > 1
                   val send = Intent(if (multi) Intent.ACTION_SEND_MULTIPLE else Intent.ACTION_SEND)
                   send.setPackage(targetPackage)
@@ -324,12 +428,21 @@ jobs:
                       val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                       cm.setPrimaryClip(ClipData.newPlainText("caption", p.text))
                       toast("Caption copied - paste it if it doesn't appear")
+                  } else if (p.captionSource == "clipboard") {
+                      toast("No caption in the share - using the text you copied")
                   }
 
+                  val summary = "$header | sent type=${send.type} files=${p.uris.size} caption=${p.captionSource}" +
+                      (if (p.notes.isEmpty()) "" else " | " + p.notes.joinToString("; "))
                   try {
                       startActivity(send)
+                      Store.log(this, "$summary | OK")
                   } catch (e: ActivityNotFoundException) {
+                      Store.log(this, "$summary | NOT FOUND: $e")
                       toast("$targetLabel isn't installed or can't receive this share")
+                  } catch (e: Exception) {
+                      Store.log(this, "$summary | FAILED: $e")
+                      toast("Couldn't open $targetLabel: ${e.message}")
                   }
               }
 
@@ -367,43 +480,132 @@ jobs:
           package com.sharebridge.app
 
           import android.app.Activity
+          import android.graphics.Typeface
           import android.os.Bundle
+          import android.widget.Button
+          import android.widget.LinearLayout
           import android.widget.ScrollView
+          import android.widget.Switch
           import android.widget.TextView
 
-          /** Tiny info screen: shows whether both apps are installed and how to use ShareBridge. */
+          /** Info screen: install status, caption option, and a log of the last shares for troubleshooting. */
           class MainActivity : Activity() {
+
+              private lateinit var logView: TextView
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
+                  val pad = (16 * resources.displayMetrics.density).toInt()
 
+                  val column = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(pad, pad * 2, pad, pad)
+                  }
+
+                  column.addView(TextView(this).apply {
+                      text = infoText()
+                      textSize = 16f
+                  })
+
+                  column.addView(Switch(this).apply {
+                      text = "If the post has no caption, use text I copied in the last 10 minutes"
+                      isChecked = Store.clipCaption(this@MainActivity)
+                      setPadding(0, pad, 0, pad)
+                      setOnCheckedChangeListener { _, checked -> Store.setClipCaption(this@MainActivity, checked) }
+                  })
+
+                  column.addView(TextView(this).apply {
+                      text = "Recent shares (for troubleshooting)"
+                      textSize = 16f
+                      setTypeface(typeface, Typeface.BOLD)
+                  })
+
+                  logView = TextView(this).apply {
+                      textSize = 12f
+                      typeface = Typeface.MONOSPACE
+                      setTextIsSelectable(true)
+                      setPadding(0, pad / 2, 0, pad / 2)
+                  }
+                  column.addView(logView)
+
+                  column.addView(Button(this).apply {
+                      text = "Clear log"
+                      setOnClickListener {
+                          Store.clearLog(this@MainActivity)
+                          refreshLog()
+                      }
+                  })
+
+                  setContentView(ScrollView(this).apply { addView(column) })
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  refreshLog()
+              }
+
+              private fun refreshLog() {
+                  logView.text = Store.readLog(this)
+              }
+
+              private fun infoText(): String {
                   fun installed(pkg: String) = runCatching { packageManager.getPackageInfo(pkg, 0) }.isSuccess
                   fun mark(ok: Boolean) = if (ok) "installed" else "NOT FOUND"
-
-                  val body = """
+                  return """
                       ShareBridge
 
                       WhatsApp (com.whatsapp): ${mark(installed("com.whatsapp"))}
                       Graph Messenger (ir.ilmili.telegraph): ${mark(installed("ir.ilmili.telegraph"))}
 
                       How to use
-                      1. In Graph Messenger, open the post and tap Share (or use the share button in the media viewer).
+                      1. In Graph Messenger, open the post's media and tap Share.
                       2. Choose "To WhatsApp" from the share sheet.
                       3. WhatsApp opens with the media and caption ready - pick the chat and send.
 
                       The other way round: in WhatsApp, share the post and choose "To Graph Messenger".
 
-                      Tip: if the share sheet is crowded, long-press "To WhatsApp" / "To Graph Messenger" and pin them to the top.
-
-                      Note: when several files are shared together, WhatsApp/Telegram may drop the caption. ShareBridge copies the caption to the clipboard in that case, so you can paste it.
+                      Graph/Telegram usually does not pass the caption when sharing media. Long-press the caption in Graph and tap Copy, then share the media: the copied text is used as the caption.
                   """.trimIndent()
+              }
+          }
+          EOF_SHAREBRIDGE
+          mkdir -p app/src/main/java/com/sharebridge/app
+          cat > app/src/main/java/com/sharebridge/app/Store.kt <<'EOF_SHAREBRIDGE'
+          package com.sharebridge.app
 
-                  val tv = TextView(this).apply {
-                      text = body
-                      textSize = 16f
-                      setPadding(48, 64, 48, 48)
-                  }
-                  setContentView(ScrollView(this).apply { addView(tv) })
+          import android.content.Context
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          /** Tiny settings + troubleshooting-log store. */
+          object Store {
+              private const val PREFS = "sharebridge"
+              private const val KEY_LOG = "log"
+              private const val KEY_CLIP = "clip_caption"
+
+              private fun prefs(ctx: Context) = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+              fun clipCaption(ctx: Context): Boolean = prefs(ctx).getBoolean(KEY_CLIP, true)
+
+              fun setClipCaption(ctx: Context, on: Boolean) {
+                  prefs(ctx).edit().putBoolean(KEY_CLIP, on).apply()
+              }
+
+              @Synchronized
+              fun log(ctx: Context, line: String) {
+                  val p = prefs(ctx)
+                  val old = (p.getString(KEY_LOG, "") ?: "").split("\n").filter { it.isNotBlank() }
+                  val stamp = SimpleDateFormat("dd MMM HH:mm:ss", Locale.getDefault()).format(Date())
+                  val all = (listOf("$stamp  $line") + old).take(12)
+                  p.edit().putString(KEY_LOG, all.joinToString("\n")).apply()
+              }
+
+              fun readLog(ctx: Context): String =
+                  (prefs(ctx).getString(KEY_LOG, "") ?: "").ifBlank { "(nothing shared yet)" }
+
+              fun clearLog(ctx: Context) {
+                  prefs(ctx).edit().remove(KEY_LOG).apply()
               }
           }
           EOF_SHAREBRIDGE
