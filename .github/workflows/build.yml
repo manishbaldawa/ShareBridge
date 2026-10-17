@@ -158,6 +158,20 @@ jobs:
                       </intent-filter>
                   </activity>
 
+                  <!-- Floating "Caption" button shown only over Graph Messenger and WhatsApp -->
+                  <service
+                      android:name=".FloatingService"
+                      android:exported="true"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+
                   <provider
                       android:name="androidx.core.content.FileProvider"
                       android:authorities="${applicationId}.fileprovider"
@@ -177,6 +191,7 @@ jobs:
               <string name="app_name">ShareBridge</string>
               <string name="to_whatsapp">To WhatsApp</string>
               <string name="to_graph">To Graph Messenger</string>
+              <string name="a11y_description">Shows a small floating Caption button over Graph Messenger and WhatsApp. When you tap it, ShareBridge reads the text visible in that app so you can pick a caption to copy. It does nothing else and sends nothing anywhere.</string>
           </resources>
           EOF_SHAREBRIDGE
           mkdir -p app/src/main/res/xml
@@ -480,17 +495,21 @@ jobs:
           package com.sharebridge.app
 
           import android.app.Activity
+          import android.content.Intent
           import android.graphics.Typeface
+          import android.net.Uri
           import android.os.Bundle
+          import android.provider.Settings
           import android.widget.Button
           import android.widget.LinearLayout
           import android.widget.ScrollView
           import android.widget.Switch
           import android.widget.TextView
 
-          /** Info screen: install status, caption option, and a log of the last shares for troubleshooting. */
+          /** Info screen: install status, floating-button setup, caption option and a log of recent shares. */
           class MainActivity : Activity() {
 
+              private lateinit var statusView: TextView
               private lateinit var logView: TextView
 
               override fun onCreate(savedInstanceState: Bundle?) {
@@ -505,6 +524,29 @@ jobs:
                   column.addView(TextView(this).apply {
                       text = infoText()
                       textSize = 16f
+                  })
+
+                  statusView = TextView(this).apply {
+                      textSize = 16f
+                      setTypeface(typeface, Typeface.BOLD)
+                      setPadding(0, pad, 0, pad / 2)
+                  }
+                  column.addView(statusView)
+
+                  column.addView(Button(this).apply {
+                      text = "1) Allow restricted settings (App info)"
+                      setOnClickListener {
+                          startActivity(
+                              Intent(
+                                  Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                  Uri.parse("package:" + this@MainActivity.packageName)
+                              )
+                          )
+                      }
+                  })
+                  column.addView(Button(this).apply {
+                      text = "2) Turn on the floating button"
+                      setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
                   })
 
                   column.addView(Switch(this).apply {
@@ -532,7 +574,7 @@ jobs:
                       text = "Clear log"
                       setOnClickListener {
                           Store.clearLog(this@MainActivity)
-                          refreshLog()
+                          refresh()
                       }
                   })
 
@@ -541,11 +583,19 @@ jobs:
 
               override fun onResume() {
                   super.onResume()
-                  refreshLog()
+                  refresh()
               }
 
-              private fun refreshLog() {
+              private fun refresh() {
                   logView.text = Store.readLog(this)
+                  statusView.text =
+                      if (serviceOn()) "Floating button: ON" else "Floating button: OFF (follow steps 1 and 2 below)"
+              }
+
+              private fun serviceOn(): Boolean {
+                  val enabled = Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES)
+                      ?: return false
+                  return enabled.contains(packageName) && enabled.contains("FloatingService")
               }
 
               private fun infoText(): String {
@@ -557,14 +607,15 @@ jobs:
                       WhatsApp (com.whatsapp): ${mark(installed("com.whatsapp"))}
                       Graph Messenger (ir.ilmili.telegraph): ${mark(installed("ir.ilmili.telegraph"))}
 
-                      How to use
-                      1. In Graph Messenger, open the post's media and tap Share.
-                      2. Choose "To WhatsApp" from the share sheet.
-                      3. WhatsApp opens with the media and caption ready - pick the chat and send.
+                      How to share a post with its caption
+                      1. In Graph Messenger open the post, so its caption is on screen.
+                      2. Tap the floating "Caption" button, then tap the caption in the list. It is copied.
+                      3. Tap Share on the post and choose "To WhatsApp".
+                      4. WhatsApp opens with the media and the caption ready - pick the chat and send.
 
-                      The other way round: in WhatsApp, share the post and choose "To Graph Messenger".
+                      The other way round: in WhatsApp share the post and choose "To Graph Messenger" (WhatsApp already passes the caption).
 
-                      Graph/Telegram usually does not pass the caption when sharing media. Long-press the caption in Graph and tap Copy, then share the media: the copied text is used as the caption.
+                      The floating button appears only over Graph Messenger and WhatsApp, and you can drag it anywhere. It needs the Accessibility permission, which Android only lets you switch on after "Allow restricted settings" for apps installed outside the Play Store (App info > three-dot menu).
                   """.trimIndent()
               }
           }
@@ -592,6 +643,15 @@ jobs:
                   prefs(ctx).edit().putBoolean(KEY_CLIP, on).apply()
               }
 
+              fun buttonPos(ctx: Context): Pair<Int, Int>? {
+                  val p = prefs(ctx)
+                  return if (p.contains("btn_x")) Pair(p.getInt("btn_x", 0), p.getInt("btn_y", 0)) else null
+              }
+
+              fun setButtonPos(ctx: Context, x: Int, y: Int) {
+                  prefs(ctx).edit().putInt("btn_x", x).putInt("btn_y", y).apply()
+              }
+
               @Synchronized
               fun log(ctx: Context, line: String) {
                   val p = prefs(ctx)
@@ -608,6 +668,317 @@ jobs:
                   prefs(ctx).edit().remove(KEY_LOG).apply()
               }
           }
+          EOF_SHAREBRIDGE
+          mkdir -p app/src/main/java/com/sharebridge/app
+          cat > app/src/main/java/com/sharebridge/app/FloatingService.kt <<'EOF_SHAREBRIDGE'
+          package com.sharebridge.app
+
+          import android.accessibilityservice.AccessibilityService
+          import android.content.ClipData
+          import android.content.ClipboardManager
+          import android.content.Context
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.text.TextUtils
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+          import kotlin.math.abs
+
+          /**
+           * Shows a small draggable "Caption" button on top of Graph Messenger and WhatsApp only.
+           *
+           * Tapping it reads the text currently visible in that app, lists the longest pieces of text,
+           * and copies the one you pick to the clipboard. ShareBridge then uses that text as the caption
+           * the next time you share media to the other app.
+           *
+           * Android's accessibility permission is all-or-nothing, so this service technically receives window
+           * events from every app. It only looks at the package name of those events (to know when to show or
+           * hide the button) and only reads on-screen text when you tap the button inside Graph or WhatsApp.
+           * Nothing is sent anywhere: the app has no internet permission.
+           */
+          class FloatingService : AccessibilityService() {
+
+              private val graphPkg = "ir.ilmili.telegraph"
+              private val whatsappPkg = "com.whatsapp"
+
+              private lateinit var wm: WindowManager
+              private var button: TextView? = null
+              private var panel: View? = null
+              private var currentPkg: String? = null
+
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+                  if (event == null || event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
+                  val pkg = event.packageName?.toString() ?: return
+                  val cls = event.className?.toString() ?: ""
+
+                  if (pkg == packageName) {
+                      // One of our own screens (main screen / share forwarder) came up: hide the overlay.
+                      if (cls.endsWith("Activity")) hideAll()
+                      return
+                  }
+                  // System bars, keyboard and the share chooser must not hide or move the button.
+                  if (pkg == "android" || pkg.contains("systemui") || pkg.contains("inputmethod") ||
+                      cls.contains("SoftInputWindow")
+                  ) return
+
+                  if (pkg == graphPkg || pkg == whatsappPkg) {
+                      currentPkg = pkg
+                      showButton()
+                  } else {
+                      currentPkg = null
+                      hideAll()
+                  }
+              }
+
+              override fun onInterrupt() {}
+
+              override fun onDestroy() {
+                  if (::wm.isInitialized) hideAll()
+                  super.onDestroy()
+              }
+
+              // ---------- floating button ----------
+
+              private fun showButton() {
+                  if (button != null) return
+                  val dm = resources.displayMetrics
+                  val d = dm.density
+
+                  val lp = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  lp.gravity = Gravity.TOP or Gravity.START
+                  val saved = Store.buttonPos(this)
+                  lp.x = saved?.first ?: (dm.widthPixels - (140 * d).toInt())
+                  lp.y = saved?.second ?: (dm.heightPixels * 0.55).toInt()
+
+                  val tv = TextView(this)
+                  tv.text = "📋 Caption"
+                  tv.setTextColor(Color.WHITE)
+                  tv.textSize = 13f
+                  tv.gravity = Gravity.CENTER
+                  val p = (10 * d).toInt()
+                  tv.setPadding(p * 2, p, p * 2, p)
+                  val bg = GradientDrawable()
+                  bg.setColor(Color.parseColor("#E60A84FF"))
+                  bg.cornerRadius = 100f * d
+                  tv.background = bg
+
+                  var downX = 0f
+                  var downY = 0f
+                  var startX = 0
+                  var startY = 0
+                  var moved = false
+                  tv.setOnTouchListener { v, ev ->
+                      when (ev.action) {
+                          MotionEvent.ACTION_DOWN -> {
+                              downX = ev.rawX
+                              downY = ev.rawY
+                              startX = lp.x
+                              startY = lp.y
+                              moved = false
+                              true
+                          }
+                          MotionEvent.ACTION_MOVE -> {
+                              val dx = (ev.rawX - downX).toInt()
+                              val dy = (ev.rawY - downY).toInt()
+                              if (abs(dx) > 12 || abs(dy) > 12) moved = true
+                              if (moved) {
+                                  lp.x = startX + dx
+                                  lp.y = startY + dy
+                                  try {
+                                      wm.updateViewLayout(v, lp)
+                                  } catch (e: Exception) {
+                                  }
+                              }
+                              true
+                          }
+                          MotionEvent.ACTION_UP -> {
+                              if (moved) Store.setButtonPos(this, lp.x, lp.y) else onGrabClicked()
+                              true
+                          }
+                          else -> false
+                      }
+                  }
+
+                  try {
+                      wm.addView(tv, lp)
+                      button = tv
+                  } catch (e: Exception) {
+                      Store.log(this, "Floating button could not be shown: $e")
+                  }
+              }
+
+              // ---------- reading the caption ----------
+
+              private fun onGrabClicked() {
+                  if (panel != null) {
+                      hidePanel()
+                      return
+                  }
+                  val root = rootInActiveWindow
+                  val pkg = root?.packageName?.toString()
+                  if (root == null || (pkg != graphPkg && pkg != whatsappPkg)) {
+                      toast("Open the post in Graph Messenger or WhatsApp first")
+                      return
+                  }
+                  val texts = LinkedHashSet<String>()
+                  collect(root, texts, 0)
+                  val top = texts.sortedByDescending { it.length }.take(5)
+                  if (top.isEmpty()) {
+                      toast("No text found on screen. Open the post so its caption is visible.")
+                      return
+                  }
+                  showPanel(top)
+              }
+
+              private fun collect(node: AccessibilityNodeInfo?, out: MutableSet<String>, depth: Int) {
+                  if (node == null || depth > 40 || out.size > 200) return
+                  if (node.isVisibleToUser) {
+                      val t = (node.text ?: node.contentDescription)?.toString()?.trim()
+                      if (!t.isNullOrEmpty() && t.length >= 6 && t.length <= 4000) out.add(t)
+                  }
+                  for (i in 0 until node.childCount) collect(node.getChild(i), out, depth + 1)
+              }
+
+              // ---------- picker panel ----------
+
+              private fun showPanel(items: List<String>) {
+                  hidePanel()
+                  val dm = resources.displayMetrics
+                  val d = dm.density
+                  val pad = (12 * d).toInt()
+
+                  val box = LinearLayout(this)
+                  box.orientation = LinearLayout.VERTICAL
+                  box.setPadding(pad, pad, pad, pad)
+                  val boxBg = GradientDrawable()
+                  boxBg.setColor(Color.parseColor("#F2202124"))
+                  boxBg.cornerRadius = 16 * d
+                  box.background = boxBg
+
+                  val title = TextView(this)
+                  title.text = "Tap the caption to copy it"
+                  title.setTextColor(Color.WHITE)
+                  title.textSize = 15f
+                  title.setTypeface(title.typeface, Typeface.BOLD)
+                  box.addView(title)
+
+                  for (item in items) {
+                      val row = TextView(this)
+                      row.text = item
+                      row.setTextColor(Color.WHITE)
+                      row.textSize = 14f
+                      row.maxLines = 4
+                      row.ellipsize = TextUtils.TruncateAt.END
+                      row.setPadding(pad, pad, pad, pad)
+                      val rowBg = GradientDrawable()
+                      rowBg.setColor(Color.parseColor("#3C4043"))
+                      rowBg.cornerRadius = 10 * d
+                      row.background = rowBg
+                      row.setOnClickListener { copyCaption(item) }
+                      val rlp = LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT,
+                          LinearLayout.LayoutParams.WRAP_CONTENT
+                      )
+                      rlp.topMargin = (8 * d).toInt()
+                      box.addView(row, rlp)
+                  }
+
+                  val cancel = TextView(this)
+                  cancel.text = "Cancel"
+                  cancel.setTextColor(Color.parseColor("#8AB4F8"))
+                  cancel.textSize = 14f
+                  cancel.gravity = Gravity.CENTER
+                  cancel.setPadding(pad, pad, pad, pad)
+                  cancel.setOnClickListener { hidePanel() }
+                  box.addView(cancel)
+
+                  val scroll = ScrollView(this)
+                  scroll.addView(box)
+
+                  val lp = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.MATCH_PARENT,
+                      (dm.heightPixels * 0.6).toInt(),
+                      WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  lp.gravity = Gravity.BOTTOM
+
+                  try {
+                      wm.addView(scroll, lp)
+                      panel = scroll
+                  } catch (e: Exception) {
+                      Store.log(this, "Caption picker could not be shown: $e")
+                  }
+              }
+
+              private fun copyCaption(text: String) {
+                  val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                  cm.setPrimaryClip(ClipData.newPlainText("caption", text))
+                  val target = if (currentPkg == graphPkg) "To WhatsApp" else "To Graph Messenger"
+                  hidePanel()
+                  Store.log(this, "Caption copied in ${currentPkg ?: "?"} (${text.length} chars)")
+                  toast("Caption copied. Now tap Share and choose \"$target\".")
+              }
+
+              // ---------- helpers ----------
+
+              private fun hidePanel() {
+                  panel?.let {
+                      try {
+                          wm.removeViewImmediate(it)
+                      } catch (e: Exception) {
+                      }
+                  }
+                  panel = null
+              }
+
+              private fun hideAll() {
+                  hidePanel()
+                  button?.let {
+                      try {
+                          wm.removeViewImmediate(it)
+                      } catch (e: Exception) {
+                      }
+                  }
+                  button = null
+              }
+
+              private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+          }
+          EOF_SHAREBRIDGE
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/accessibility_config.xml <<'EOF_SHAREBRIDGE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagReportViewIds|flagIncludeNotImportantViews"
+              android:canRetrieveWindowContent="true"
+              android:description="@string/a11y_description"
+              android:notificationTimeout="200"
+              android:settingsActivity="com.sharebridge.app.MainActivity" />
           EOF_SHAREBRIDGE
           find . -type f | sort
 
